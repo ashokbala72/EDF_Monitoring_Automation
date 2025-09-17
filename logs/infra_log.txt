@@ -1,0 +1,7 @@
+2025-09-17 01:00:33 ERROR Server down in cluster CL-01
+2025-09-17 01:05:55 WARN Disk usage > 85% on INFRA-SERVER-02
+2025-09-17 01:10:21 ERROR Network switch failure in DC1
+2025-09-17 01:35:00 ERROR Security patch missing on INFRA-SERVER-03
+2025-09-17 02:00:10 ERROR Power failure in Rack 12
+2025-09-17 02:30:00 ERROR RAID array degraded on INFRA-SERVER-05
+2025-09-17 03:10:33 ERROR Network latency > 500ms for site2site VPN

@@ -1,0 +1,6 @@
+2025-09-17 01:00:11 ERROR ESB real-time transaction failed
+2025-09-17 01:10:45 ERROR ESB server crash detected
+2025-09-17 01:25:44 ERROR ESB log file corrupted
+2025-09-17 02:10:21 ERROR Apps DBA monitoring detected invalid session
+2025-09-17 02:35:00 ERROR OPA maintenance job failed
+2025-09-17 03:15:44 ERROR Apps DBA CFM job incomplete

@@ -1,0 +1,7 @@
+2025-09-17 01:05:12 ERROR PI Data Archive connection lost
+2025-09-17 01:10:33 WARN High CPU usage detected on GM-SERVER-01
+2025-09-17 01:15:00 ERROR Application log indicates failed sync job
+2025-09-17 01:35:55 ERROR GM daily scheduled job failed
+2025-09-17 02:10:41 ERROR Version mismatch detected in PI AF configuration
+2025-09-17 02:15:23 WARN License nearing expiration in GM module
+2025-09-17 03:00:01 ERROR Critical vulnerability found in GM config
