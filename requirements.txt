@@ -1,7 +1,16 @@
-streamlit
-python-dotenv
-openai>=1.0.0
-reportlab
-fpdf2
-pandas
-watchdog
+# Core App
+streamlit==1.38.0
+
+# Machine Learning
+scikit-learn==1.5.2
+joblib==1.4.2
+
+# PDF Generation
+fpdf==1.7.2
+
+# Utilities
+pandas==2.2.2
+numpy==1.26.4
+
+# (Optional but useful)
+python-dotenv==1.0.1
