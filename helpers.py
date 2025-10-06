@@ -1,145 +1,187 @@
-import os
-import json
+import os, re, json, sqlite3
+from datetime import datetime
 from fpdf import FPDF
-from openai import AzureOpenAI
-from dotenv import load_dotenv
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+import joblib
 
-try:
-    import json5
-    HAS_JSON5 = True
-except ImportError:
-    HAS_JSON5 = False
+# ==========================================================
+# ================  SELF-LEARNING DB SETUP  =================
+# ==========================================================
+DB_PATH = "learning_store.db"
 
-load_dotenv()
+def init_learning_db():
+    """Create categories table if not exists."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_category TEXT,
+            sub_category TEXT,
+            keywords TEXT,
+            last_seen TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# -----------------------------
-# Azure OpenAI client
-# -----------------------------
-client = AzureOpenAI(
-    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-    api_version="2024-12-01-preview",  # fixed to your version
-    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-)
-DEPLOYMENT_NAME = "gpt-4o-raj"  # fixed to your deployment
+def add_or_update_subcategory(parent, subcat, keywords):
+    """Insert or update a sub-category entry with latest keywords."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id FROM categories WHERE parent_category=? AND sub_category=?;",
+        (parent, subcat)
+    )
+    row = c.fetchone()
+    now = datetime.now().isoformat()
+    if row:
+        c.execute(
+            "UPDATE categories SET keywords=?, last_seen=? WHERE id=?;",
+            (json.dumps(keywords), now, row[0])
+        )
+    else:
+        c.execute(
+            "INSERT INTO categories (parent_category, sub_category, keywords, last_seen) VALUES (?, ?, ?, ?);",
+            (parent, subcat, json.dumps(keywords), now)
+        )
+    conn.commit()
+    conn.close()
 
-# -----------------------------
-# Category → Log file mapping
-# -----------------------------
-CATEGORY_LOG_FILES = {
-    "CSP Monitoring": "csp_log.txt",
-    "GIS Data Monitoring": "gisdata_log.txt",
-    "GM Data Monitoring": "gmdata_log.txt",
-    "Infrastructure Health": "infra_log.txt",
-    "MS Data Monitoring": "msdata_log.txt",
-    "Oracle Monitoring": "oracle_log.txt",
-    "WebOps Monitoring": "webops_log.txt",
-}
+def get_all_training_data():
+    """Return (text, subcat) pairs from DB."""
+    conn = sqlite3.connect(DB_PATH)
+    df = []
+    for row in conn.execute("SELECT parent_category, sub_category, keywords FROM categories"):
+        parent, subcat, keywords = row
+        for kw in json.loads(keywords):
+            df.append((kw, subcat))
+    conn.close()
+    return df
 
-# -----------------------------
-# Read full log file
-# -----------------------------
+
+# ==========================================================
+# ===================  ML MODEL SECTION  ====================
+# ==========================================================
+MODEL_PATH = "models/subcat_clf.pkl"
+VEC_PATH = "models/subcat_vec.pkl"
+
+def train_ml_classifier():
+    """Train or reload classifier from DB."""
+    os.makedirs("models", exist_ok=True)
+    data = get_all_training_data()
+    if not data:
+        # bootstrap small model
+        sample_logs = [
+            "database connection failed",
+            "cpu usage high",
+            "disk full",
+            "login failed",
+            "backup failed"
+        ]
+        y = ["DB issue", "Infra issue", "Infra issue", "Security", "Backup"]
+        vectorizer = TfidfVectorizer()
+        X = vectorizer.fit_transform(sample_logs)
+        clf = LogisticRegression(max_iter=200)
+        clf.fit(X, y)
+        joblib.dump(clf, MODEL_PATH)
+        joblib.dump(vectorizer, VEC_PATH)
+        return clf, vectorizer
+
+    texts, labels = zip(*data)
+    vectorizer = TfidfVectorizer()
+    X = vectorizer.fit_transform(texts)
+    clf = LogisticRegression(max_iter=200)
+    clf.fit(X, labels)
+    joblib.dump(clf, MODEL_PATH)
+    joblib.dump(vectorizer, VEC_PATH)
+    return clf, vectorizer
+
+def load_ml_classifier():
+    if os.path.exists(MODEL_PATH) and os.path.exists(VEC_PATH):
+        return joblib.load(MODEL_PATH), joblib.load(VEC_PATH)
+    return train_ml_classifier()
+
+def predict_subcategory(log_line, parent_category, clf, vectorizer, threshold=0.8):
+    """Predict sub-category and update DB if confident."""
+    if not log_line.strip():
+        return None, 0.0
+    X = vectorizer.transform([log_line])
+    pred = clf.predict(X)[0]
+    prob = clf.predict_proba(X).max()
+    if prob >= threshold:
+        add_or_update_subcategory(parent_category, pred, [log_line])
+        return pred, prob
+    return None, prob
+
+
+# ==========================================================
+# ===================  LOG CLASSIFIER  ======================
+# ==========================================================
 def read_log_file(file_path):
-    """Read full log file contents."""
     try:
         with open(file_path, "r") as f:
             return f.read()
     except FileNotFoundError:
         return ""
 
-# -----------------------------
-# Azure OpenAI call
-# -----------------------------
-def send_to_azure_openai(log_text: str, category: str):
-    """
-    GPT must return only issues specific to the category.
-    If none exist, return { "issues": [ { "Inference": "No issues in this category" } ] }.
-    """
-
-    prompt = f"""
-    You are an ITSM monitoring assistant.
-
-    Task: Analyze the logs ONLY for the category: "{category}".
-
-    Rules:
-    - Search carefully for issues that match this category.
-    - If you find relevant issues, return ONLY those issues.
-    - If there are truly no relevant issues, return:
-      {{ "issues": [ {{ "Inference": "No issues in this category" }} ] }}
-    - Never output "No issues in this category" together with real issues.
-    - Always output JSON with a top-level key "issues".
-    - Each real issue must include:
-      Inference, Severity (High/Medium/Low), Reasons (2–3 bullet points),
-      Action, Why, BusinessImpact.
-    - If no issues, return a single object with only:
-      "Inference": "No issues in this category"
-
-    Logs:
-    {log_text}
-    """
-
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": "You are a strict IT monitoring assistant. Only return issues relevant to the category. If none, output { 'issues': [ { 'Inference': 'No issues in this category' } ] }."},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            max_completion_tokens=800,
-        )
-
-        content = response.choices[0].message.content.strip()
-        data = json.loads(content)
-
-        issues = data.get("issues", [])
-
-        # Safety net: if GPT mixes, drop "No issues"
-        if any(i.get("Inference") == "No issues in this category" for i in issues) and len(issues) > 1:
-            issues = [i for i in issues if i.get("Inference") != "No issues in this category"]
-
-        # If GPT returns empty, force a fallback
-        if not issues:
-            return [{"Inference": "No issues in this category"}]
-
-        return issues
-
-    except Exception as e:
-        return [{
-            "Inference": "Error processing logs",
-            "Severity": "High",
-            "Reasons": [str(e)],
-            "Action": "Check Azure OpenAI setup",
-            "Why": "AI call failed",
-            "BusinessImpact": "No monitoring results available",
-        }]
+def filter_logs_by_category(log_text: str, category: str):
+    """Basic regex filter by category keywords."""
+    filtered, matched = [], []
+    for line in log_text.splitlines():
+        lower_line = line.lower()
+        if re.search(r"(error|fail|warn|exception|timeout)", lower_line):
+            filtered.append(line)
+            matched.append(line.strip())
+    return "\n".join(filtered), matched
 
 
-# -----------------------------
-# Analyze all categories
-# -----------------------------
-def analyze_all_logs(base_dir="./"):
-    """Analyze all logs across categories and return dict {category: issues}."""
-    results = {}
-    for category, filename in CATEGORY_LOG_FILES.items():
-        file_path = os.path.join(base_dir, filename)
-        log_text = read_log_file(file_path)
-        if not log_text.strip():
-            results[category] = [{"Inference": "No issues in this category"}]
-        else:
-            results[category] = send_to_azure_openai(log_text, category=category)
-    return results
+# ==========================================================
+# ===================  ISSUE DETECTOR  ======================
+# ==========================================================
+def local_log_ai(log_text: str, category: str, matched_lines=None):
+    """Classify lines as issue / no-issue."""
+    if not log_text.strip():
+        return [{"Inference": f"No issues found for {category}"}]
 
-# -----------------------------
-# PDF Report
-# -----------------------------
+    issues = []
+    vec_path, model_path = VEC_PATH, MODEL_PATH
+    if os.path.exists(model_path):
+        clf = joblib.load(model_path)
+        vectorizer = joblib.load(vec_path)
+    else:
+        clf, vectorizer = train_ml_classifier()
+
+    for line in log_text.splitlines():
+        X = vectorizer.transform([line])
+        pred = clf.predict(X)[0]
+        prob = clf.predict_proba(X).max()
+        if "issue" in pred.lower() or prob > 0.6:
+            sev = "High" if prob > 0.8 else "Medium" if prob > 0.6 else "Low"
+            issues.append({
+                "Inference": f"Issue detected in {category}",
+                "Severity": sev,
+                "Reasons": [line.strip()],
+                "Action": "Investigate the issue",
+                "Why": "Detected unusual or problematic log behavior",
+                "BusinessImpact": "Potential service degradation or outage"
+            })
+
+    if not issues:
+        return [{"Inference": f"No issues found for {category}"}]
+    return issues
+
+
+# ==========================================================
+# ===================  PDF REPORT  ==========================
+# ==========================================================
 def generate_pdf_report(report_type, content, output_path, only_high=True):
-    """Generate a PDF report. If only_high=True, include only High severity issues."""
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=14)
     pdf.cell(200, 10, txt=f"{report_type} Report", ln=True, align="C")
     pdf.ln(10)
-
     pdf.set_font("Arial", size=10)
 
     if isinstance(content, dict):
@@ -147,27 +189,15 @@ def generate_pdf_report(report_type, content, output_path, only_high=True):
             pdf.set_font("Arial", "B", size=12)
             pdf.cell(200, 8, txt=category, ln=True)
             pdf.set_font("Arial", size=10)
-            if not issues or (
-                len(issues) == 1 and issues[0].get("Inference") == "No issues in this category"
-            ):
-                pdf.multi_cell(0, 8, txt="✅ No Issues in this category")
+            if not issues or ("No issues" in issues[0].get("Inference", "")):
+                pdf.multi_cell(0, 8, txt="✅ No Issues")
                 pdf.ln(2)
                 continue
             for issue in issues:
-                severity = str(issue.get("Severity", "")).lower()
-                if only_high and severity != "high":
+                sev = str(issue.get("Severity", "")).lower()
+                if only_high and sev != "high":
                     continue
                 pdf.multi_cell(0, 8, txt=json.dumps(issue, indent=2))
                 pdf.ln(2)
-
-    elif isinstance(content, list):
-        for issue in content:
-            severity = str(issue.get("Severity", "")).lower()
-            if only_high and severity != "high":
-                continue
-            pdf.multi_cell(0, 8, txt=json.dumps(issue, indent=2))
-            pdf.ln(2)
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     pdf.output(output_path)
     return output_path
